@@ -1,0 +1,121 @@
+from PyQt5 import QtCore, QtGui, QtWidgets,uic
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from PyQt5.QtWidgets import *
+
+import sys
+import threading
+
+import matplotlib.pyplot as plt
+
+import simulation as sim
+import colonysim_params as ps
+import colony_util as util
+
+global params
+params = ps.Sim_params()
+
+global final_list
+global col_sizes
+
+class MyWindow(QtWidgets.QMainWindow):
+    
+    def __init__(self):
+        super(MyWindow,self).__init__()
+
+        self.ui = uic.loadUi('colonysim.ui',self)
+    
+        #Pre-fill lineEdits with defaults
+        self.ui.lineEdit_simLength.setText(str(params.getSIM_LENGTH()))
+        self.ui.lineEdit_capacity.setText(str(params.getSHIP_CAPACITY()))
+        self.ui.lineEdit_arrival.setText(str(params.getTRAVEL_TIME()))
+        self.ui.lineEdit_crewRatio.setText(str(params.getCREW_RATIO()))
+        self.ui.lineEdit_deathThresh.setText(str(params.getDEATH_THRESH()))
+        self.ui.lineEdit_cooldown.setText(str(params.getCOOLDOWN()))
+        self.ui.lineEdit_maxPreg.setText(str(params.getMAX_PREG()))
+        self.ui.lineEdit_newGenPeriod.setText(str(params.getNEWGEN_PERIOD()))
+        self.ui.lineEdit_newGenWindow.setText(str(params.getNEWGEN_WINDOW()))
+        self.ui.lineEdit_pregThresh.setText(str(params.getPREG_THRESH()))
+        self.ui.lineEdit_reproMinAge.setText(str(params.getPREG_AGE_MIN()))
+        self.ui.lineEdit_reproMaxAge.setText(str(params.getPREG_AGE_MAX()))
+        
+        # Text change functions
+        self.calcYears()
+        self.showCrewRatios()
+        self.ui.lineEdit_simLength.textChanged.connect(self.calcYears)
+        self.ui.lineEdit_capacity.textChanged.connect(self.showCrewRatios)
+        self.ui.lineEdit_crewRatio.textChanged.connect(self.showCrewRatios)
+        
+        # Button functions
+        self.ui.pushButtonStart.clicked.connect(self.pushButtonStartClicked)
+        
+    def set_params(self):
+        params.setSIM_LENGTH(int(self.ui.lineEdit_simLength.text()))
+        params.setSHIP_CAPACITY(int(self.ui.lineEdit_capacity.text()))
+        params.setTRAVEL_TIME(int(self.ui.lineEdit_arrival.text()))
+        params.setDEATH_THRESH(int(self.ui.lineEdit_deathThresh.text()))
+        params.setCOOLDOWN(int(self.ui.lineEdit_cooldown.text()))
+        params.setMAX_PREG(int(self.ui.lineEdit_maxPreg.text()))
+        params.setNEWGEN_PERIOD(int(self.ui.lineEdit_newGenPeriod.text()))
+        params.setNEWGEN_WINDOW(int(self.ui.lineEdit_newGenWindow.text()))
+        params.setPREG_THRESH(int(self.ui.lineEdit_pregThresh.text()))
+        params.setPREG_AGE_MIN(int(self.ui.lineEdit_reproMinAge.text()))
+        params.setPREG_AGE_MAX(int(self.ui.lineEdit_reproMaxAge.text()))
+    
+    def plot_thread(self):
+        plt.plot(range(0, params.getSIM_LENGTH()), col_sizes)
+        #plt.ion()
+        plt.show()
+        #plt.pause(0.001)
+    
+    def simulation_thread(self):
+            self.ui.pushButtonStart.setEnabled(False)
+            self.ui.listFinalPop.clear()
+            
+            self.set_params()
+            
+            global final_list
+            global col_sizes
+
+            for a in range(0,5):
+                final_list, col_sizes = sim.simulation(params, self.ui.label_progress)
+                
+                for x in final_list:
+                    if x.getName() == "Martian":
+                        self.ui.listFinalPop.addItem(str(x.getAge())+" "+str(x.getSex())+", "+str(x.getName())+", "+str(x.getArrivalDate()))
+                self.ui.pushButtonStart.setEnabled(True)
+                
+                plotTh = threading.Thread(target=self.plot_thread, args=[])
+                plotTh.start()
+        
+    
+    def pushButtonStartClicked(self):
+    
+        th = threading.Thread(target=self.simulation_thread, args=[])
+        th.start()
+        
+    def calcYears(self):
+        text = self.ui.lineEdit_simLength.text()
+        
+        if text:
+            yrs = int(text)/365.0
+            self.ui.label_simYears.setText("= " + str(round(yrs, 2)) + " years")
+        else: 
+            self.ui.label_simYears.setText("= N/A")
+            
+    def showCrewRatios(self):
+        capacity = self.ui.lineEdit_capacity.text()
+        ratio = self.ui.lineEdit_crewRatio.text()
+        
+        if ratio and capacity:
+            male_crew,female_crew = util.ratioCalculator(int(capacity), float(ratio))
+            self.ui.label_crewRatioDisplay.setText("= " + str(round(male_crew, 2)) + " M, " + str(round(female_crew, 2)) + " F crew members")
+        else: 
+            self.ui.label_crewRatioDisplay.setText("= N/A, set ratio")
+        
+if __name__== '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    window = MyWindow()
+    window.show() 
+
+    sys.exit(app.exec_())

@@ -1,0 +1,6 @@
+currently it checks probabilitiy of death, and kills them if it is lower than a random number
+Death could probably be calculated at the start wen they get there, or they are born
+instead of just removing them when they die, should there be a new list?
+
+could there be an associated risk factor for different ages when being pregnant?
+pregnancy system needs work generally
