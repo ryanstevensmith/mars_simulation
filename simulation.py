@@ -85,15 +85,3 @@ def simulation(params, label):
     print(max(sizes))
     
     return colony, sizes
-    '''
-    x = Astronaut("m")
-    y = Astronaut("f")
-    a = Martian()
-    b = Martian()
-    c = Martian()
-    print(x.getAge(), x.getSex(), x.getName())
-    print(y.getAge(), y.getSex(), y.getName())
-    print(a.getAge(), a.getSex(), a.isChild(), a.getName())
-    print(b.getAge(), b.getSex(), b.isChild(), b.getName())
-    print(c.getAge(), c.getSex(), c.isChild(), c.getName())
-    '''
