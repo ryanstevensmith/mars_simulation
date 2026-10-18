@@ -31,10 +31,29 @@ python -m unittest discover -s tests
 | `simulation.py` | The day-by-day model. No GUI dependency; call `simulation(params, progress=None, seed=None)` |
 | `colonists.py` | `Astronaut` and `Martian` (born on Mars) |
 | `colonysim_params.py` | `SimParams` dataclass holding every tunable number |
+| `colony_replay.py` | Turns a run's recorded event log into moving dots (no GUI code, unit tested) |
+| `colony_view.py` | Qt widgets that draw the live colony view and its playback controls |
 | `analysis.py` | Summary stats across runs (extinction odds, final population, main killer) |
 | `sweep.py` | Parameter sweep over ship capacity and arrival period, in parallel |
 | `colony_util.py` | Loads the CSV tables once and converts annual probabilities to daily ones |
 | `mars_gui.py` / `colonysim.ui` | PyQt5 front end; the simulation runs in a worker thread |
+
+### Colony view
+
+When a run finishes, a live map of the colony opens and starts playing (WATCH COLONY reopens it,
+SHOW CHARTS gives the plots). Each ship lands a new habitat dome with a farm beside it; dots are
+colonists wandering between home, farm and neighbours.
+
+- Blue = Earth-born, amber = Mars-born, small = children, faded = over 65, pink ring = pregnant
+- A white ring marks a birth; a drifting wisp marks a death, coloured by cause
+  (grey natural, orange starvation, purple oxygen, green epidemic, red breach)
+- Dust storms tint the map and blow dust; epidemics turn dots green; breaches flash a dome red;
+  the farm greens with the food supply and the dome turns red as it overcrowds
+- Controls: play/pause, speed from 1 day/s to 2 years/s, restart, a scrub slider (drag to any day,
+  forwards or backwards), and a run selector. The strip at the bottom is population over time with
+  disaster ticks.
+
+Positions are cosmetic: the model has no space, but the dot count always equals the model's population.
 
 ### Parameters
 

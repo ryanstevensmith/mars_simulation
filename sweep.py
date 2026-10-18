@@ -20,7 +20,7 @@ import simulation as sim
 def run_cell(args):
     """Run one grid cell (capacity, period) `runs` times; returns (capacity, period, extinct, finals)."""
     capacity, period, runs, years, seed = args
-    params = ps.SimParams(SHIP_CAPACITY=capacity, ARRIVAL_PERIOD=period, SIM_LENGTH=int(years * 365))
+    params = ps.SimParams(SHIP_CAPACITY=capacity, ARRIVAL_PERIOD=period, SIM_LENGTH=int(years * 365), RECORD_TIMELINE=False)
     results = [sim.simulation(params, seed=seed + n) for n in range(runs)]
     extinct = sum(r.extinct_day is not None for r in results)
     return capacity, period, extinct, [r.sizes[-1] for r in results]

@@ -10,7 +10,7 @@ DAYS_PER_YEAR = 365
 
 
 class Colonist:
-    __slots__ = ("sex", "birth_day", "arrival_date", "pregnant_days", "cooldown_until")
+    __slots__ = ("sex", "birth_day", "arrival_date", "pregnant_days", "cooldown_until", "uid", "home")
 
     def __init__(self, age, sex, arrival_date):
         self.sex = sex
@@ -19,6 +19,8 @@ class Colonist:
         self.arrival_date = arrival_date
         self.pregnant_days = None   # None = not pregnant, else days pregnant so far
         self.cooldown_until = 0     # first day a new pregnancy may start
+        self.uid = -1               # unique id, assigned by the simulation
+        self.home = 0               # index of the ship (habitat module) they live in
 
     def getAge(self, day):
         """Age in whole years on the given simulation day."""

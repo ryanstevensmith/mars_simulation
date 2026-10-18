@@ -28,6 +28,11 @@ class SimResult:
     habitat: list = field(default_factory=list)     # people the habitat can support each day
     death_causes: dict = field(default_factory=lambda: {c: 0 for c in CAUSES})
     events: list = field(default_factory=list)      # (day, kind, detail) for each disaster
+    # Replay log for the colony viewer, in the order things happened:
+    #   ("ship", day, module) ("arrive", day, uid, sex, age, module) ("birth", day, uid, sex, mother_uid)
+    #   ("conceive", day, uid) ("death", day, uid, cause) ("storm"|"epidemic", day, end_day)
+    #   ("breach", day, module)
+    timeline: list = field(default_factory=list)
     extinct_day: Optional[int] = None               # day the last colonist died, if it happened
 
     @property
@@ -65,6 +70,8 @@ def simulation(params, progress=None, seed=None):
 
     colony = []
     result = SimResult(colony, params.SIM_LENGTH)
+    log = result.timeline.append if params.RECORD_TIMELINE else (lambda event: None)
+    next_uid = 0
     pregnant_count = 0
     ships_landed = 0
     food_stock = 0.0
@@ -81,7 +88,13 @@ def simulation(params, progress=None, seed=None):
 
         # --- arrivals ---
         if day % params.ARRIVAL_PERIOD == 0:
-            colony += arrivalFromEarth(day, params, rng)
+            crew = arrivalFromEarth(day, params, rng)
+            log(("ship", day, ships_landed))
+            for x in crew:
+                x.uid, x.home = next_uid, ships_landed
+                next_uid += 1
+                log(("arrive", day, x.uid, x.sex, x.getAge(day), x.home))
+            colony += crew
             ships_landed += 1
             food_stock = min(params.FOOD_STORAGE_MAX, food_stock + params.SHIP_FOOD_STOCK)
 
@@ -90,17 +103,21 @@ def simulation(params, progress=None, seed=None):
         if rng.random() < params.DUST_STORMS_PER_YEAR / 365:
             length = rng.randint(30, 90)
             storm_until = max(storm_until, day + length)
+            log(("storm", day, storm_until))
             result.events.append((day, "dust storm", str(length) + " days"))
         if rng.random() < params.EPIDEMICS_PER_YEAR / 365:
             length = rng.randint(20, 60)
             epidemic_until = max(epidemic_until, day + length)
+            log(("epidemic", day, epidemic_until))
             result.events.append((day, "epidemic", str(length) + " days"))
         if rng.random() < params.BREACHES_PER_YEAR / 365:
             n = min(rng.randint(1, max(1, params.BREACH_MAX_DEATHS)), len(colony))
             if params.BREACH_MAX_DEATHS == 0:
                 n = 0
-            victims = set(id(x) for x in rng.sample(colony, n))
+            victim_list = rng.sample(colony, n)
+            victims = set(id(x) for x in victim_list)
             breach_until = day + BREACH_REPAIR_DAYS
+            log(("breach", day, victim_list[0].home if victim_list else max(0, ships_landed - 1)))
             result.events.append((day, "habitat breach", str(n) + " killed"))
         storm = day < storm_until
         epidemic = day < epidemic_until
@@ -155,6 +172,7 @@ def simulation(params, progress=None, seed=None):
             if cause:
                 died += 1
                 result.death_causes[cause] += 1
+                log(("death", day, x.uid, cause))
                 if x.isPregnant():
                     pregnant_count -= 1
                 continue
@@ -165,7 +183,11 @@ def simulation(params, progress=None, seed=None):
                     if x.pregnant_days >= params.PREG_THRESH:
                         x.birth(day, params.COOLDOWN)
                         pregnant_count -= 1
-                        newborns.append(col.Martian(day, rng))
+                        baby = col.Martian(day, rng)
+                        baby.uid, baby.home = next_uid, x.home
+                        next_uid += 1
+                        newborns.append(baby)
+                        log(("birth", day, baby.uid, baby.sex, x.uid))
                 elif (conceiving_open
                       and day >= x.cooldown_until
                       and params.PREG_AGE_MIN <= age <= params.PREG_AGE_MAX
@@ -173,6 +195,7 @@ def simulation(params, progress=None, seed=None):
                       and rng.random() < conception_hz[i] * fertility):
                     x.startPregnant()
                     pregnant_count += 1
+                    log(("conceive", day, x.uid))
 
             survivors.append(x)
 

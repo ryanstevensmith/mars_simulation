@@ -28,6 +28,7 @@ class SimParams:
     MORTALITY_SCALE: float = 1.0    # multiplier on the annual death rates in death_prob.csv
     RUNS: int = 5                   # simulations to run and compare
     SEED: Optional[int] = None      # set for reproducible runs (run n uses SEED + n)
+    RECORD_TIMELINE: bool = True    # keep the event log the colony viewer replays (sweeps turn it off)
 
     # --- Food (units per day) ---
     # Each landed ship brings a farm that produces FOOD_PER_SHIP a day for the rest of the

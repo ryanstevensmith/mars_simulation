@@ -11,6 +11,7 @@ import simulation as sim
 import colonysim_params as ps
 import colony_util as util
 import analysis
+import colony_view
 
 UI_FILE = Path(__file__).resolve().parent / 'colonysim.ui'
 
@@ -66,6 +67,7 @@ class MyWindow(QtWidgets.QMainWindow):
         self.ui.lineEdit_reproMaxAge.setText(str(defaults.PREG_AGE_MAX))
 
         self.add_extra_fields(defaults)
+        self.add_result_buttons()
 
         # Text change functions
         self.calcYears()
@@ -107,6 +109,28 @@ class MyWindow(QtWidgets.QMainWindow):
             self.extra_edits[field] = edit
             form.addRow(label, edit)
         grid.addLayout(form, 15, 0)
+
+    def add_result_buttons(self):
+        self.results = None
+        self.colony_window = None
+        self.watch_button = QtWidgets.QPushButton("WATCH COLONY")
+        self.charts_button = QtWidgets.QPushButton("SHOW CHARTS")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.watch_button)
+        row.addWidget(self.charts_button)
+        self.ui.gridLayout.addLayout(row, 45, 0)
+        for b in (self.watch_button, self.charts_button):
+            b.setEnabled(False)
+        self.watch_button.clicked.connect(self.show_colony)
+        self.charts_button.clicked.connect(lambda: self.plot(self.results))
+
+    def show_colony(self):
+        """Open the animated colony view (it starts playing straight away)."""
+        if self.colony_window is not None:
+            self.colony_window.close()
+        self.colony_window = colony_view.ColonyWindow(self.results, self.params)
+        self.colony_window.show()
+        self.colony_window.toggle_play()
 
     def read_params(self):
         """Build a validated SimParams from the form. Raises ValueError on bad input."""
@@ -185,7 +209,10 @@ class MyWindow(QtWidgets.QMainWindow):
         for day, kind, detail in last.events:
             self.ui.listFinalPop.insertItem(0, "day " + str(day) + ": " + kind + " (" + detail + ")")
 
-        self.plot(results)
+        self.results = results
+        self.watch_button.setEnabled(True)
+        self.charts_button.setEnabled(True)
+        self.show_colony()
 
     def plot(self, results):
         fig, (ax_pop, ax_food, ax_death) = plt.subplots(3, 1, figsize=(9, 10))
