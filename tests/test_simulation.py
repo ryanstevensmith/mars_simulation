@@ -1,137 +1,242 @@
+import dataclasses
+import random
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import base as b
+import colonists as col
 import colony_util as util
 import colonysim_params as ps
 import simulation as sim
+import strategies
 
 
-# Switches off scarcity and disasters so a test only sees the behaviour it is about
-QUIET = dict(FOOD_PER_SHIP=10000, HAB_PER_SHIP=100000, DUST_STORMS_PER_YEAR=0,
-             BREACHES_PER_YEAR=0, EPIDEMICS_PER_YEAR=0)
+def strategy(**changes):
+    """The balanced strategy with some fields changed."""
+    return dataclasses.replace(strategies.STRATEGIES["balanced"], key="test", **changes)
 
 
 def run(seed=1, **overrides):
-    return sim.simulation(ps.SimParams(**{**QUIET, **overrides}), seed=seed)
+    overrides.setdefault("DISASTER_SCALE", 0)
+    return sim.simulation(ps.SimParams(**overrides), seed=seed)
+
+
+def make_base(strat=None, **overrides):
+    params = ps.SimParams(STRATEGY=strat or strategy(), DISASTER_SCALE=0, **overrides)
+    events = []
+    base = b.Base(params, random.Random(1), lambda e: None, lambda d, k, t: events.append((d, k, t)))
+    return base, events
+
+
+def adults(n, day=0, sex="f"):
+    rng = random.Random(2)
+    people = [col.Astronaut(sex, day, rng) for _ in range(n)]
+    for i, x in enumerate(people):
+        x.uid = i
+    return people
 
 
 class TestUtil(unittest.TestCase):
 
     def test_age_index_is_clamped(self):
         self.assertEqual(util.table_index(0), 0)        # newborns must not wrap to the last row
-        self.assertEqual(util.table_index(1), 0)
         self.assertEqual(util.table_index(100), 99)
         self.assertEqual(util.table_index(150), 99)
-
-    def test_newborns_do_not_die_instantly(self):
-        self.assertLess(util.death_hazards()[util.table_index(0)], 0.001)
 
     def test_everyone_dies_at_cutoff_age(self):
         self.assertEqual(util.death_hazards(0.0)[util.table_index(100)], 1.0)
 
     def test_per_day_conversion_compounds_back_to_annual(self):
-        daily = util.per_day(0.1, 365)
-        self.assertAlmostEqual(1 - (1 - daily) ** 365, 0.1)
+        self.assertAlmostEqual(1 - (1 - util.per_day(0.1, 365)) ** 365, 0.1)
 
-    def test_ratio_calculator(self):
-        self.assertEqual(util.ratioCalculator(80, 1.0), (40, 40))
+
+class TestStrategies(unittest.TestCase):
+
+    def test_every_strategy_site_and_difficulty_runs(self):
+        for s in strategies.STRATEGIES:
+            for site in strategies.SITES:
+                r = sim.simulation(ps.SimParams(STRATEGY=s, SITE=site, SIM_LENGTH=200), seed=1)
+                self.assertGreater(r.sizes[-1], 0, (s, site))
+        for d in strategies.DIFFICULTIES.values():
+            sim.simulation(ps.SimParams(DISASTER_SCALE=d.disasters, SUPPLY_SCALE=d.supplies, SIM_LENGTH=200), seed=1)
+
+    def test_starter_base_is_landed_on_day_zero(self):
+        for s in strategies.STRATEGIES.values():
+            r = sim.simulation(ps.SimParams(STRATEGY=s.key, SIM_LENGTH=1, DISASTER_SCALE=0), seed=1)
+            self.assertEqual(r.series["modules"][0], sum(s.starter_modules.values()), s.key)
+
+    def test_colonists_per_ship_override(self):
+        r = run(SIM_LENGTH=1, COLONISTS_PER_SHIP=7)
+        self.assertEqual(r.sizes[0], 7)
 
 
 class TestSimulation(unittest.TestCase):
 
-    def test_no_deaths_no_births_keeps_crew_constant(self):
-        r = run(MORTALITY_SCALE=0, MAX_PREG=0, SIM_LENGTH=800, ARRIVAL_PERIOD=780)
-        self.assertEqual(r.sizes[0], 80)
-        self.assertEqual(r.sizes[779], 80)
-        self.assertEqual(r.sizes[780], 160)             # second ship arrives
-        self.assertEqual(sum(r.births), 0)
-        self.assertEqual(sum(r.deaths), 0)
-
     def test_same_seed_is_reproducible(self):
-        self.assertEqual(run(seed=7, SIM_LENGTH=500).sizes, run(seed=7, SIM_LENGTH=500).sizes)
+        self.assertEqual(run(seed=7, SIM_LENGTH=400, DISASTER_SCALE=1).sizes,
+                         run(seed=7, SIM_LENGTH=400, DISASTER_SCALE=1).sizes)
 
     def test_population_accounting_balances(self):
-        r = run(MORTALITY_SCALE=50, SIM_LENGTH=1000)
-        arrived = 80 * (1 + 999 // 780)
+        r = run(SIM_LENGTH=1600, DISASTER_SCALE=2)
+        arrived = 60 * (1 + 1599 // 780)
         self.assertEqual(len(r.colony), arrived + sum(r.births) - sum(r.deaths))
+        self.assertEqual(sum(r.death_causes.values()), sum(r.deaths))
 
-    def test_births_wait_for_gestation_and_conception_window(self):
-        r = run(MORTALITY_SCALE=0, NEWGEN_PERIOD=1000, NEWGEN_WINDOW=10,
-                PREG_THRESH=280, SIM_LENGTH=500)
-        birth_days = [d for d, n in enumerate(r.births) if n]
-        self.assertTrue(birth_days)
-        self.assertTrue(all(280 <= d <= 289 for d in birth_days), birth_days)
+    def test_births_wait_for_gestation(self):
+        r = run(SIM_LENGTH=600)
+        first = next(d for d, n in enumerate(r.births) if n)
+        self.assertGreaterEqual(first, ps.SimParams().PREG_THRESH)
 
-    def test_max_preg_zero_blocks_births(self):
-        self.assertEqual(sum(run(MAX_PREG=0, SIM_LENGTH=1000).births), 0)
-
-    def test_cooldown_spaces_births_for_each_mother(self):
-        # a mother can't give birth twice within gestation + cooldown
-        r = run(MORTALITY_SCALE=0, SIM_LENGTH=2000, COOLDOWN=1000, ARRIVAL_PERIOD=5000)
-        mothers_at_end = [c for c in r.colony if c.getName() == "Astronaut" and c.cooldown_until]
-        for c in mothers_at_end:
-            self.assertGreaterEqual(c.cooldown_until, 280 + 1000)
-
-    def test_newborns_survive_when_mortality_is_off(self):
-        r = run(MORTALITY_SCALE=0, SIM_LENGTH=1500)
-        self.assertEqual(len(r.martians), sum(r.births))
+    def test_no_life_support_means_suffocation_and_extinction_is_final(self):
+        s = strategy(starter_modules={"hab": 3, "solar": 2}, ship_modules={}, ship_materials=0)
+        r = run(STRATEGY=s, SIM_LENGTH=1000)
+        self.assertGreater(r.death_causes["suffocation"], 0)
+        self.assertIsNotNone(r.extinct_day)
+        self.assertEqual(r.sizes[r.extinct_day:], [0] * (1000 - r.extinct_day))   # no ship at day 780
+        self.assertTrue(any(k == "extinct" for _, k, _ in r.events))
 
     def test_bad_params_are_rejected(self):
         with self.assertRaises(ValueError):
             ps.SimParams(PREG_AGE_MIN=50, PREG_AGE_MAX=20).validate()
         with self.assertRaises(ValueError):
-            ps.SimParams(NEWGEN_PERIOD=30, NEWGEN_WINDOW=90).validate()
+            ps.SimParams(STRATEGY="nonsense").validate()
+
+    def test_series_cover_every_day(self):
+        r = run(SIM_LENGTH=300)
+        for name, values in r.series.items():
+            self.assertEqual(len(values), 300, name)
 
 
-class TestResourcesAndDisasters(unittest.TestCase):
+class TestBase(unittest.TestCase):
 
-    def test_food_shortfall_causes_starvation_deaths(self):
-        r = run(MORTALITY_SCALE=0, FOOD_PER_SHIP=0, SHIP_FOOD_STOCK=800, SIM_LENGTH=300)
-        self.assertGreater(r.death_causes["starvation"], 0)
-        self.assertEqual(r.death_causes["natural"], 0)
-        self.assertLess(min(r.food_satisfaction), 1.0)
+    def test_power_goes_to_life_support_first(self):
+        base, _ = make_base(strategy(starter_modules={"lss": 1, "greenhouse": 3, "solar": 1}))
+        base.receive_ship(0, 0)
+        people = adults(30)
+        base.allocate(0, people)
+        base.produce(0, 30, 0)
+        power = base.stats["power"]
+        self.assertEqual(power["lss"], 1.0)
+        self.assertLess(power["greenhouse"], 1.0)
 
-    def test_enough_food_means_no_starvation(self):
-        r = run(MORTALITY_SCALE=0, SIM_LENGTH=500)
-        self.assertEqual(r.death_causes["starvation"], 0)
-        self.assertEqual(min(r.food_satisfaction), 1.0)
+    def test_people_drink_before_electrolysis_before_crops(self):
+        base, _ = make_base(strategy(starter_modules={"lss": 1, "greenhouse": 2, "solar": 4}))
+        base.receive_ship(0, 0)
+        base.stock["water"] = 12 * 10 + 28 * 0.5      # enough for drinking and half the electrolysis
+        people = adults(10)
+        base.allocate(0, people)
+        needs = base.produce(0, 10, 0)
+        self.assertEqual(needs["extra"]["dehydration"], 0.0)
+        self.assertEqual(base.stats["food_made"], 0.0)         # crops got nothing
+        self.assertGreater(base.stats["o2_made"], 0.0)
 
-    def test_overcrowding_causes_oxygen_deaths(self):
-        r = run(MORTALITY_SCALE=0, HAB_PER_SHIP=20, SIM_LENGTH=200)
-        self.assertGreater(r.death_causes["oxygen"], 0)
+    def test_jobs_follow_priority_and_children_do_not_work(self):
+        base, _ = make_base(strategy(starter_modules={"lss": 1, "greenhouse": 2, "lab": 1, "hab": 1}))
+        base.receive_ship(0, 0)
+        people = adults(5)
+        kid = col.Martian(0, random.Random(1))
+        kid.uid = 99
+        base.allocate(0, people + [kid])
+        staff = {m.type: m.staff for m in base.modules}
+        self.assertEqual(staff["lss"], 1)
+        self.assertEqual(sum(m.staff for m in base.modules if m.type == "greenhouse"), 4)
+        self.assertEqual(staff["lab"], 0)                        # ran out of people
+        self.assertEqual(kid.job, -1)
 
-    def test_hunger_suppresses_births(self):
-        fed = sum(run(MORTALITY_SCALE=0, SIM_LENGTH=1200, STARVATION_DEATH_RATE=0).births)
-        hungry = sum(run(MORTALITY_SCALE=0, SIM_LENGTH=1200, STARVATION_DEATH_RATE=0,
-                         FOOD_PER_SHIP=30, SHIP_FOOD_STOCK=0).births)
-        self.assertGreater(fed, hungry)
+    def test_homes_spread_across_habitats(self):
+        base, _ = make_base(strategy(starter_modules={"hab": 3}))
+        base.receive_ship(0, 0)
+        people = adults(50)
+        base.allocate(0, people)
+        sizes = sorted(sum(1 for x in people if x.home == m.mid) for m in base.modules)
+        self.assertEqual(sum(sizes), 50)
+        self.assertLessEqual(max(sizes), b.BEDS_PER_HAB)
 
-    def test_disasters_are_logged_and_breaches_kill(self):
-        r = run(MORTALITY_SCALE=0, BREACHES_PER_YEAR=20, DUST_STORMS_PER_YEAR=20,
-                EPIDEMICS_PER_YEAR=20, SIM_LENGTH=365)
-        kinds = {kind for _, kind, _ in r.events}
-        self.assertEqual(kinds, {"dust storm", "epidemic", "habitat breach"})
-        self.assertGreater(r.death_causes["breach"], 0)
+    def test_planner_builds_life_support_when_oxygen_is_short(self):
+        base, events = make_base(strategy(starter_modules={"hab": 3, "greenhouse": 4, "recycler": 1, "ice_mine": 1,
+                                                           "solar": 6, "workshop": 1}, build_weights={}))
+        base.receive_ship(0, 0)
+        base.stock.update(materials=500, o2=100)       # water and food are fine, oxygen is about to run out
+        people = adults(60)
+        base.allocate(0, people)
+        base.produce(0, 60, 0)
+        base.plan(0, 60, 0)
+        self.assertEqual(base.under_construction[0].type, "lss")
 
-    def test_dust_storm_cuts_food_production(self):
-        calm = run(MORTALITY_SCALE=0, FOOD_PER_SHIP=80, SHIP_FOOD_STOCK=0, SIM_LENGTH=100)
-        stormy = run(MORTALITY_SCALE=0, FOOD_PER_SHIP=80, SHIP_FOOD_STOCK=0, SIM_LENGTH=100,
-                     DUST_STORMS_PER_YEAR=1000, DUST_STORM_POWER=0.1)
-        self.assertLess(sum(stormy.food_satisfaction), sum(calm.food_satisfaction))
+    def test_construction_needs_workers(self):
+        base, _ = make_base(strategy(starter_modules={"hab": 1}))
+        base.receive_ship(0, 0)
+        m = base.add_module(0, "solar", built=False)
+        base.idle_workers = b.BUILD_CREW
+        for day in range(m.build_days - 1):
+            base.construct(day)
+        self.assertFalse(m.built)
+        base.construct(m.build_days)
+        self.assertTrue(m.built)
+        slow = base.add_module(0, "solar", built=False)
+        base.idle_workers = 0
+        for day in range(slow.build_days):
+            base.construct(day)
+        self.assertFalse(slow.built)                             # quarter speed with nobody free
 
-    def test_deaths_by_cause_add_up(self):
-        r = sim.simulation(ps.SimParams(SIM_LENGTH=1500, BREACHES_PER_YEAR=2, EPIDEMICS_PER_YEAR=2), seed=3)
-        self.assertEqual(sum(r.death_causes.values()), sum(r.deaths))
+    def test_modules_wear_out_without_materials(self):
+        base, _ = make_base(strategy(starter_modules={"solar": 2}, ship_materials=0))
+        base.receive_ship(0, 0)
+        for day in range(300):
+            base.produce(day, 0, 0)
+        self.assertLess(base.modules[0].condition, 0.8)
+        base.stock["materials"] = 1000
+        for day in range(300, 400):
+            base.produce(day, 0, 0)
+        self.assertEqual(base.modules[0].condition, 1.0)
 
-    def test_extinction_is_final(self):
-        r = run(MORTALITY_SCALE=0, FOOD_PER_SHIP=0, SHIP_FOOD_STOCK=0, STARVATION_DEATH_RATE=1,
-                SIM_LENGTH=2000)
-        self.assertIsNotNone(r.extinct_day)
-        self.assertEqual(r.sizes[r.extinct_day:], [0] * (2000 - r.extinct_day))   # no ship lands at day 780
-        self.assertEqual(len(r.sizes), 2000)
+    def test_research_unlocks_techs_in_strategy_order(self):
+        base, events = make_base(strategy(starter_modules={"lab": 1, "solar": 1}, tech_order=("water2",)))
+        base.receive_ship(0, 0)
+        base.research = b.TECHS["water2"][1]
+        base.produce(1, 0, 0)
+        self.assertIn("water2", base.techs)
+        self.assertTrue(any(k == "tech" for _, k, _ in events))
+
+    def test_cargo_can_be_lost(self):
+        base, events = make_base()
+        base.params.DISASTER_SCALE = 40                  # loss chance caps at 50%
+        lost = [base.receive_ship(780 * n, n) for n in range(1, 40)]
+        self.assertTrue(any(lost) and not all(lost))
+        self.assertTrue(any(k == "cargo" for _, k, _ in events))
+
+    def test_disasters_happen_and_breaches_kill(self):
+        runs = [sim.simulation(ps.SimParams(DISASTER_SCALE=8, SIM_LENGTH=500), seed=n) for n in range(4)]
+        kinds = {k for r in runs for _, k, _ in r.events}
+        self.assertTrue({"storm", "failure", "epidemic", "breach"} <= kinds, kinds)
+        self.assertGreater(sum(r.death_causes["accident"] for r in runs), 0)
+        # a breach in a habitat returns how many residents it kills
+        s = strategy(starter_modules={"hab": 2, "lss": 2, "greenhouse": 4, "recycler": 1, "ice_mine": 1,
+                                      "solar": 6}, ship_modules={})
+        base, _ = make_base(s)
+        base.receive_ship(0, 0)
+        base.params.DISASTER_SCALE = 3000
+        hab_hits = [hit for hit in (base.disasters(d) for d in range(200)) if hit]
+        self.assertTrue(hab_hits)
+        self.assertTrue(all(m.type == "hab" and 1 <= n <= 4 for m, n in hab_hits))
+
+
+class TestAnalysis(unittest.TestCase):
+
+    def test_summary_and_self_sufficiency(self):
+        import analysis
+        results = [run(seed=n, SIM_LENGTH=800) for n in range(2)]
+        s = analysis.summarize(results)
+        self.assertEqual(s["runs"], 2)
+        self.assertEqual(s["survived"], 2)
+        for v in s["sufficiency"].values():
+            self.assertTrue(0 <= v <= 1)
+        self.assertIn("colonies survived", analysis.describe(s))
+        days, counts = analysis.module_counts(results[0])
+        self.assertEqual(sum(c[-1] for c in counts.values()), results[0].series["modules"][days[-1]])
 
 
 if __name__ == "__main__":

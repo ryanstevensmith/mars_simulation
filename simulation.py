@@ -10,39 +10,44 @@ from typing import Optional
 
 import colony_util as util
 import colonists as col
+from base import Base, PLAN_EVERY
 
-CAUSES = ("natural", "starvation", "oxygen", "epidemic", "breach")
-BREACH_REPAIR_DAYS = 30
-BREACH_HAB_LOSS = 0.25
+CAUSES = ("natural", "starvation", "dehydration", "suffocation", "epidemic", "accident")
+SERIES = ("food", "water", "o2", "materials", "research", "power_supply", "power_demand",
+          "food_made", "food_need", "o2_made", "o2_need", "water_in", "water_out",
+          "food_sat", "water_sat", "o2_sat", "coverage", "beds", "crowding", "modules", "workers", "idle")
+POP_MILESTONES = (100, 250, 500, 1000, 2000, 5000)
 
 
 @dataclass
 class SimResult:
+    params: object
     colony: list                                    # colonists alive at the end
     end_day: int                                    # day number to compute final ages from
     sizes: list = field(default_factory=list)       # population at the end of each day
     births: list = field(default_factory=list)      # births on each day
     deaths: list = field(default_factory=list)      # deaths on each day
-    food_stock: list = field(default_factory=list)  # stored food at the end of each day
-    food_satisfaction: list = field(default_factory=list)   # share of the day's food need met (0-1)
-    habitat: list = field(default_factory=list)     # people the habitat can support each day
     death_causes: dict = field(default_factory=lambda: {c: 0 for c in CAUSES})
-    events: list = field(default_factory=list)      # (day, kind, detail) for each disaster
-    # Replay log for the colony viewer, in the order things happened:
-    #   ("ship", day, module) ("arrive", day, uid, sex, age, module) ("birth", day, uid, sex, mother_uid)
-    #   ("conceive", day, uid) ("death", day, uid, cause) ("storm"|"epidemic", day, end_day)
-    #   ("breach", day, module)
-    timeline: list = field(default_factory=list)
+    events: list = field(default_factory=list)      # mission log: (day, kind, text)
     extinct_day: Optional[int] = None               # day the last colonist died, if it happened
+    series: dict = field(default_factory=lambda: {k: [] for k in SERIES})   # daily base figures
+    snapshots: list = field(default_factory=list)   # (day, per-module (condition, efficiency, progress))
+    module_types: list = field(default_factory=list)  # module type by module id
+    techs: list = field(default_factory=list)       # (day, tech key) in unlock order
+    # Replay log for the colony viewer, in the order things happened:
+    #   ("ship", day, ship_no) ("arrive", day, uid, sex, age) ("birth", day, uid, sex, mother_uid)
+    #   ("conceive", day, uid) ("death", day, uid, cause) ("home"|"job", day, uid, module or -1)
+    #   ("module", day, mid, type, "start"|"built") ("damage", day, mid, "failure"|"breach")
+    #   ("storm"|"epidemic", day, end_day) ("tech", day, key)
+    timeline: list = field(default_factory=list)
 
     @property
     def martians(self):
         return [c for c in self.colony if c.getName() == "Martian"]
 
 
-# TODO: move to colony_utils.py
 def arrivalFromEarth(arrivalDate, params, rng):
-    male_crew, female_crew = util.ratioCalculator(params.SHIP_CAPACITY, params.CREW_RATIO)
+    male_crew, female_crew = util.ratioCalculator(params.colonists_per_ship, params.CREW_RATIO)
 
     crew = [col.Astronaut("m", arrivalDate, rng) for _ in range(male_crew)]
     crew += [col.Astronaut("f", arrivalDate, rng) for _ in range(female_crew)]
@@ -50,102 +55,83 @@ def arrivalFromEarth(arrivalDate, params, rng):
     return crew
 
 
+def run_one(args):
+    """(params, seed) -> SimResult. Top-level so it can run in a process pool."""
+    params, seed = args
+    return simulation(params, seed=seed)
+
+
 def simulation(params, progress=None, seed=None):
     """Run one simulation and return a SimResult.
 
     progress, if given, is called as progress(days_done, total_days) about once a
     simulated month, so the model stays independent of any GUI.
-
-    Each day: ships may land, disasters may start, food is eaten and grown, then every
-    colonist faces death (natural causes plus any starvation / overcrowding / epidemic /
-    breach risk) and women may conceive or give birth. If the colony dies out, it stays
-    dead: no more ships come.
     """
     params.validate()
     rng = random.Random(seed)
+    result = SimResult(params, [], params.SIM_LENGTH)
+    log = result.timeline.append if params.RECORD_TIMELINE else (lambda e: None)
 
+    def event(day, kind, text):
+        result.events.append((day, kind, text))
+
+    base = Base(params, rng, log, event)
     death_hz = util.death_hazards(params.MORTALITY_SCALE)
-    windowed = params.NEWGEN_PERIOD > 0
-    conception_hz = util.conception_hazards(params.NEWGEN_WINDOW if windowed else 365)
+    conception_hz = util.conception_hazards(365)
+    work_min = params.WORK_AGE_MIN
 
     colony = []
-    result = SimResult(colony, params.SIM_LENGTH)
-    log = result.timeline.append if params.RECORD_TIMELINE else (lambda event: None)
-    next_uid = 0
     pregnant_count = 0
-    ships_landed = 0
-    food_stock = 0.0
-    storm_until = epidemic_until = breach_until = -1
-    total_days = params.SIM_LENGTH
+    ship_no = 0
+    next_uid = 0
+    realloc = True
     extinct = False
+    milestones = list(POP_MILESTONES)
+    first_birth = first_adult = False
+    sufficient_streak = 0
+    total_days = params.SIM_LENGTH
 
     for day in range(total_days):
         if extinct:
-            for series in (result.sizes, result.births, result.deaths, result.food_stock,
-                           result.food_satisfaction, result.habitat):
-                series.append(0)
+            for series in (result.sizes, result.births, result.deaths, *result.series.values()):
+                series.append(series[-1] if series is not result.sizes and series is not result.births
+                              and series is not result.deaths and series else 0)
             continue
 
-        # --- arrivals ---
+        # --- ships ---
         if day % params.ARRIVAL_PERIOD == 0:
-            crew = arrivalFromEarth(day, params, rng)
-            log(("ship", day, ships_landed))
-            for x in crew:
-                x.uid, x.home = next_uid, ships_landed
+            log(("ship", day, ship_no))
+            base.receive_ship(day, ship_no)
+            for x in arrivalFromEarth(day, params, rng):
+                x.uid = next_uid
                 next_uid += 1
-                log(("arrive", day, x.uid, x.sex, x.getAge(day), x.home))
-            colony += crew
-            ships_landed += 1
-            food_stock = min(params.FOOD_STORAGE_MAX, food_stock + params.SHIP_FOOD_STOCK)
+                log(("arrive", day, x.uid, x.sex, x.getAge(day)))
+                colony.append(x)
+            ship_no += 1
+            realloc = True
 
         # --- disasters ---
         victims = set()
-        if rng.random() < params.DUST_STORMS_PER_YEAR / 365:
-            length = rng.randint(30, 90)
-            storm_until = max(storm_until, day + length)
-            log(("storm", day, storm_until))
-            result.events.append((day, "dust storm", str(length) + " days"))
-        if rng.random() < params.EPIDEMICS_PER_YEAR / 365:
-            length = rng.randint(20, 60)
-            epidemic_until = max(epidemic_until, day + length)
-            log(("epidemic", day, epidemic_until))
-            result.events.append((day, "epidemic", str(length) + " days"))
-        if rng.random() < params.BREACHES_PER_YEAR / 365:
-            n = min(rng.randint(1, max(1, params.BREACH_MAX_DEATHS)), len(colony))
-            if params.BREACH_MAX_DEATHS == 0:
-                n = 0
-            victim_list = rng.sample(colony, n)
-            victims = set(id(x) for x in victim_list)
-            breach_until = day + BREACH_REPAIR_DAYS
-            log(("breach", day, victim_list[0].home if victim_list else max(0, ships_landed - 1)))
-            result.events.append((day, "habitat breach", str(n) + " killed"))
-        storm = day < storm_until
-        epidemic = day < epidemic_until
-        breach = day < breach_until
+        hit = base.disasters(day)
+        if hit:
+            hab, n = hit
+            residents = [x for x in colony if x.home == hab.mid]
+            victims = set(id(x) for x in rng.sample(residents, min(n, len(residents))))
+            event(day, "breach", "Hull breach in {}: {} killed".format(hab.label, len(victims)))
 
-        # --- resources ---
-        pop = len(colony)
-        need = pop * params.FOOD_PER_PERSON
-        available = food_stock + ships_landed * params.FOOD_PER_SHIP * (params.DUST_STORM_POWER if storm else 1.0)
-        eaten = min(need, available)
-        satisfaction = eaten / need if need > 0 else 1.0
-        food_stock = min(params.FOOD_STORAGE_MAX, available - eaten)
+        if realloc or day % PLAN_EVERY == 0:
+            base.allocate(day, colony)
+            realloc = False
 
-        capacity = ships_landed * params.HAB_PER_SHIP * ((1 - BREACH_HAB_LOSS) if breach else 1.0)
-        overcrowding = max(0.0, (pop - capacity) / pop) if pop > 0 else 0.0
-
-        # extra daily death chances, by cause (all colonists share them)
-        extra = {
-            "starvation": params.STARVATION_DEATH_RATE * (1 - satisfaction),
-            "oxygen": params.OVERCROWD_DEATH_RATE * overcrowding,
-            "epidemic": params.EPIDEMIC_DEATH_RATE if epidemic else 0.0,
-        }
-        extra_total = 1 - (1 - extra["starvation"]) * (1 - extra["oxygen"]) * (1 - extra["epidemic"])
-
-        # rationing and cramped conditions both suppress conceptions
-        fertility = satisfaction * (min(1.0, capacity / pop) if pop > 0 else 1.0)
-
-        conceiving_open = (not windowed) or (day % params.NEWGEN_PERIOD < params.NEWGEN_WINDOW)
+        children = sum(1 for x in colony if x.getAge(day) < work_min)
+        needs = base.produce(day, len(colony) - children, children)
+        extra = needs["extra"]
+        extra_total = 1.0
+        for p in extra.values():
+            extra_total *= 1 - p
+        extra_total = 1 - extra_total
+        natural_scale = needs["natural_scale"]
+        fertility = needs["fertility"]
 
         survivors = []
         newborns = []
@@ -157,22 +143,22 @@ def simulation(params, progress=None, seed=None):
 
             cause = None
             if id(x) in victims:
-                cause = "breach"
+                cause = "accident"
             else:
-                base = death_hz[i] if age >= params.DEATH_THRESH else 0.0
-                p = base + extra_total - base * extra_total
+                base_p = 1.0 if death_hz[i] >= 1 else death_hz[i] * natural_scale
+                p = base_p + extra_total - base_p * extra_total
                 if p > 0 and rng.random() < p:
                     if extra_total == 0:
                         cause = "natural"
                     else:
-                        cause = rng.choices(
-                            ("natural", "starvation", "oxygen", "epidemic"),
-                            weights=(base, extra["starvation"], extra["oxygen"], extra["epidemic"]))[0]
+                        cause = rng.choices(("natural",) + tuple(extra),
+                                            weights=(base_p,) + tuple(extra.values()))[0]
 
             if cause:
                 died += 1
                 result.death_causes[cause] += 1
                 log(("death", day, x.uid, cause))
+                base.on_death(x)
                 if x.isPregnant():
                     pregnant_count -= 1
                 continue
@@ -188,10 +174,8 @@ def simulation(params, progress=None, seed=None):
                         next_uid += 1
                         newborns.append(baby)
                         log(("birth", day, baby.uid, baby.sex, x.uid))
-                elif (conceiving_open
-                      and day >= x.cooldown_until
+                elif (day >= x.cooldown_until
                       and params.PREG_AGE_MIN <= age <= params.PREG_AGE_MAX
-                      and pregnant_count < params.MAX_PREG
                       and rng.random() < conception_hz[i] * fertility):
                     x.startPregnant()
                     pregnant_count += 1
@@ -201,18 +185,61 @@ def simulation(params, progress=None, seed=None):
 
         colony = survivors + newborns
         result.colony = colony
+
+        # --- building ---
+        if base.construct(day):
+            realloc = True
+        if day % PLAN_EVERY == 0:
+            days_to_ship = params.ARRIVAL_PERIOD - day % params.ARRIVAL_PERIOD
+            base.plan(day, len(colony), params.colonists_per_ship if days_to_ship < 300 else 0)
+
+        # --- milestones ---
+        if newborns and not first_birth:
+            first_birth = True
+            event(day, "milestone", "First child born on Mars")
+        while milestones and len(colony) >= milestones[0]:
+            event(day, "milestone", "Population passed {}".format(milestones.pop(0)))
+        if not first_adult and day % 30 == 0 and any(x.getName() == "Martian" and x.getAge(day) >= 18 for x in colony):
+            first_adult = True
+            event(day, "milestone", "First Mars-born colonist comes of age")
+        st = base.stats
+        if (st["food_made"] >= st["food_need"] and st["o2_made"] >= st["o2_need"]
+                and st["water_in"] >= st["water_out"]):
+            sufficient_streak += 1
+            if sufficient_streak == 365:
+                event(day, "milestone", "A full year self-sufficient in food, water and oxygen")
+        else:
+            sufficient_streak = 0 if sufficient_streak < 365 else sufficient_streak
+
+        # --- records ---
         result.sizes.append(len(colony))
         result.births.append(len(newborns))
         result.deaths.append(died)
-        result.food_stock.append(food_stock)
-        result.food_satisfaction.append(satisfaction)
-        result.habitat.append(capacity)
+        rec = result.series
+        for k in ("food", "water", "o2", "materials"):
+            rec[k].append(base.stock[k])
+        rec["research"].append(base.research)
+        for k in ("power_supply", "power_demand", "food_made", "food_need", "o2_made", "o2_need",
+                  "water_in", "water_out", "food_sat", "water_sat", "o2_sat", "coverage", "beds", "crowding"):
+            rec[k].append(st[k])
+        rec["modules"].append(sum(1 for m in base.modules if m.built))
+        rec["idle"].append(base.idle_workers)
+        rec["workers"].append(sum(m.staff for m in base.modules))
+        if day % PLAN_EVERY == 0 or len(base.modules) != len(result.module_types):
+            result.module_types = [m.type for m in base.modules]
+            result.snapshots.append((day, base.snapshot()))
 
         if not colony:
             extinct = True
             result.extinct_day = day
+            event(day, "extinct", "The colony has died out")
 
         if progress and (day % 30 == 0 or day == total_days - 1):
             progress(day + 1, total_days)
 
+    result.techs = [(e[1], e[2]) for e in result.timeline if e[0] == "tech"] if params.RECORD_TIMELINE else \
+        [(None, t) for t in base.techs]
+    result.module_types = [m.type for m in base.modules]
+    result.final_modules = {k: sum(1 for m in base.modules if m.type == k and m.built) for k in base.counts}
+    result.final_techs = sorted(base.techs)
     return result

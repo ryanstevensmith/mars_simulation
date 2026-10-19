@@ -1,4 +1,3 @@
-import math
 import sys
 import unittest
 from pathlib import Path
@@ -9,12 +8,16 @@ import colonysim_params as ps
 import colony_replay as rp
 import simulation as sim
 
+_cache = {}
+
 
 def make(seed=2, **overrides):
-    params = ps.SimParams(**{"SIM_LENGTH": 1800, "BREACHES_PER_YEAR": 3, "EPIDEMICS_PER_YEAR": 2,
-                             "DUST_STORMS_PER_YEAR": 2, **overrides})
-    result = sim.simulation(params, seed=seed)
-    return result, rp.ReplayState(result, params)
+    key = (seed, tuple(sorted(overrides.items())))
+    if key not in _cache:
+        params = ps.SimParams(**{"SIM_LENGTH": 1800, "DISASTER_SCALE": 3, **overrides})
+        _cache[key] = sim.simulation(params, seed=seed)
+    result = _cache[key]
+    return result, rp.ReplayState(result)
 
 
 class TestReplay(unittest.TestCase):
@@ -28,7 +31,7 @@ class TestReplay(unittest.TestCase):
     def test_playing_forward_matches_seeking(self):
         result, state = make()
         while not state.finished:
-            state.advance(0.05, 40)                      # 2 days per step
+            state.advance(0.05, 60)                      # 3 days per step
             self.assertEqual(len(state.dots), result.sizes[state.day_index])
 
     def test_seeking_backwards_works(self):
@@ -37,36 +40,41 @@ class TestReplay(unittest.TestCase):
         state.seek(300)
         self.assertEqual(len(state.dots), result.sizes[300])
 
-    def test_counts_split_astronauts_and_martians(self):
-        result, state = make(MORTALITY_SCALE=0, STARVATION_DEATH_RATE=0, BREACHES_PER_YEAR=0,
-                             EPIDEMICS_PER_YEAR=0, FOOD_PER_SHIP=10000)
-        state.seek(1799)
-        astronauts, martians = state.counts()
-        self.assertEqual(astronauts, 80 * 3)
-        self.assertEqual(martians, len(result.martians))
+    def test_built_modules_match_the_model(self):
+        result, state = make()
+        for day in (0, 400, 800, 1799):
+            state.seek(day)
+            built = sum(1 for s in state.modules.values() if s == "built")
+            self.assertEqual(built, result.series["modules"][day], day)
 
-    def test_dots_stay_inside_the_world_and_near_modules(self):
-        _, state = make()
-        for _ in range(200):
-            state.advance(0.05, 20)
-        reach = state.spacing * math.sqrt(state.modules + 1) + 3 * state.module_radius
+    def test_everyone_has_a_home_and_jobs_are_real_modules(self):
+        result, state = make()
+        state.seek(1000)
         for d in state.dots.values():
-            self.assertLess(math.hypot(d.x - rp.CENTER[0], d.y - rp.CENTER[1]), reach + 50)
+            self.assertIn(d.home, state.modules)
+            self.assertEqual(state.module_types[d.home], "hab")
+            if d.job != -1:
+                self.assertIn(d.job, state.modules)
 
-    def test_ships_and_deaths_create_effects(self):
+    def test_layout_has_no_overlapping_modules(self):
+        result, state = make(STRATEGY="frontier", SIM_LENGTH=3000)
+        slots = list(state.layout.slots.values())
+        self.assertEqual(len(slots), len(state.module_types))
+        seen = set()
+        for s in slots:
+            key = (round(s.x), round(s.y))
+            self.assertNotIn(key, seen)
+            seen.add(key)
+
+    def test_effects_and_toasts_appear(self):
         _, state = make()
-        kinds = set()
+        kinds, toasts = set(), set()
         while not state.finished:
-            state.advance(0.05, 30)
+            state.advance(0.05, 40)
             kinds |= {e.kind for e in state.effects}
-        self.assertTrue({"ship", "ghost"} <= kinds, kinds)
-
-    def test_modules_grow_with_each_ship(self):
-        _, state = make()
-        state.seek(0)
-        self.assertEqual(state.modules, 1)
-        state.seek(1799)
-        self.assertEqual(state.modules, 3)
+            toasts |= {t[1] for t in state.toasts}
+        self.assertTrue({"ship", "built"} <= kinds, kinds)
+        self.assertIn("built", toasts)
 
     def test_timeline_can_be_switched_off(self):
         result = sim.simulation(ps.SimParams(SIM_LENGTH=100, RECORD_TIMELINE=False), seed=1)

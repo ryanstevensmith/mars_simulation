@@ -1,11 +1,11 @@
-"""Parameter sweep: how do ship capacity and arrival period change the colony's odds?
+"""Compare every strategy at every landing site over many runs.
 
-    python sweep.py                                   # 4x4 grid, 10 runs per cell
-    python sweep.py --capacity 40 80 120 --period 400 780 --runs 20 --years 20
-    python sweep.py --out sweep.png --workers 4
+    python sweep.py                                    # all strategies x sites, 10 runs each
+    python sweep.py --difficulty brutal --runs 20 --years 40
+    python sweep.py --strategies frontier tech --sites hellas --out frontier_vs_tech.png
 
-Prints a table of extinction probability and median final population for every
-combination and saves heatmaps of both. Cells run in parallel, one process per core.
+Prints a table of survival rate and median final population for every combination and
+saves heatmaps of both. Runs go in parallel, one process per core.
 """
 
 import argparse
@@ -15,56 +15,56 @@ from concurrent.futures import ProcessPoolExecutor
 
 import colonysim_params as ps
 import simulation as sim
+import strategies
 
 
 def run_cell(args):
-    """Run one grid cell (capacity, period) `runs` times; returns (capacity, period, extinct, finals)."""
-    capacity, period, runs, years, seed = args
-    params = ps.SimParams(SHIP_CAPACITY=capacity, ARRIVAL_PERIOD=period, SIM_LENGTH=int(years * 365), RECORD_TIMELINE=False)
+    """Run one (strategy, site) cell `runs` times; returns (strategy, site, survived, finals)."""
+    strategy, site, difficulty, runs, years, seed = args
+    d = strategies.DIFFICULTIES[difficulty]
+    params = ps.SimParams(STRATEGY=strategy, SITE=site, SIM_LENGTH=int(years * 365),
+                          DISASTER_SCALE=d.disasters, SUPPLY_SCALE=d.supplies, RECORD_TIMELINE=False)
     results = [sim.simulation(params, seed=seed + n) for n in range(runs)]
-    extinct = sum(r.extinct_day is not None for r in results)
-    return capacity, period, extinct, [r.sizes[-1] for r in results]
+    survived = sum(r.extinct_day is None for r in results)
+    return strategy, site, survived, [r.sizes[-1] for r in results]
 
 
-def sweep(capacities, periods, runs, years, seed, workers):
-    cells = [(c, p, runs, years, seed) for c, p in itertools.product(capacities, periods)]
+def sweep(strats, sites, difficulty, runs, years, seed, workers):
+    cells = [(s, site, difficulty, runs, years, seed) for s, site in itertools.product(strats, sites)]
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        return {(c, p): (extinct, finals) for c, p, extinct, finals in pool.map(run_cell, cells)}
+        return {(s, site): (ok, finals) for s, site, ok, finals in pool.map(run_cell, cells)}
 
 
-def print_table(data, capacities, periods, runs):
-    print("\nextinction probability / median final population  (rows: ship capacity, columns: arrival period in days)")
-    print("capacity".rjust(9) + "".join(str(p).rjust(16) for p in periods))
-    for c in capacities:
-        row = str(c).rjust(9)
-        for p in periods:
-            extinct, finals = data[(c, p)]
-            row += "{:.0%} / {:g}".format(extinct / runs, statistics.median(finals)).rjust(16)
+def print_table(data, strats, sites, runs):
+    print("\nsurvival / median final population")
+    print("".rjust(22) + "".join(strategies.SITES[s].name.rjust(20) for s in sites))
+    for s in strats:
+        row = strategies.STRATEGIES[s].name.rjust(22)
+        for site in sites:
+            ok, finals = data[(s, site)]
+            row += "{:.0%} / {:,.0f}".format(ok / runs, statistics.median(finals)).rjust(20)
         print(row)
 
 
-def save_heatmaps(data, capacities, periods, runs, path):
+def save_heatmaps(data, strats, sites, runs, path, difficulty):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     panels = (
-        ("Extinction probability", lambda e, f: e / runs, "Reds", 0, 1),
-        ("Median final population", lambda e, f: statistics.median(f), "Greens", 0, None),
+        ("Survival rate", lambda ok, f: ok / runs, "RdYlGn", 0, 1, "{:.0%}"),
+        ("Median final population", lambda ok, f: statistics.median(f), "Greens", 0, None, "{:,.0f}"),
     )
-    for ax, (title, value, cmap, vmin, vmax) in zip(axes, panels):
-        grid = [[value(*data[(c, p)]) for p in periods] for c in capacities]
-        im = ax.imshow(grid, cmap=cmap, aspect="auto", origin="lower", vmin=vmin, vmax=vmax)
-        ax.set_xticks(range(len(periods)), [str(p) for p in periods])
-        ax.set_yticks(range(len(capacities)), [str(c) for c in capacities])
-        ax.set_xlabel("Arrival period (days)")
-        ax.set_ylabel("Ship capacity")
-        ax.set_title(title)
+    for ax, (title, value, cmap, vmin, vmax, fmt) in zip(axes, panels):
+        grid = [[value(*data[(s, site)]) for site in sites] for s in strats]
+        im = ax.imshow(grid, cmap=cmap, aspect="auto", vmin=vmin, vmax=vmax)
+        ax.set_xticks(range(len(sites)), [strategies.SITES[s].name for s in sites])
+        ax.set_yticks(range(len(strats)), [strategies.STRATEGIES[s].name for s in strats])
+        ax.set_title("{} ({}, {} runs each)".format(title, difficulty, runs))
         for i, row in enumerate(grid):
             for j, v in enumerate(row):
-                ax.text(j, i, "{:.0%}".format(v) if title.startswith("Ext") else "{:g}".format(v),
-                        ha="center", va="center", fontsize=9)
+                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=9)
         fig.colorbar(im, ax=ax)
     fig.tight_layout()
     fig.savefig(path, dpi=130)
@@ -73,8 +73,9 @@ def save_heatmaps(data, capacities, periods, runs, path):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--capacity", type=int, nargs="+", default=[20, 40, 80, 120])
-    ap.add_argument("--period", type=int, nargs="+", default=[390, 780, 1170, 1560])
+    ap.add_argument("--strategies", nargs="+", default=list(strategies.STRATEGIES), choices=list(strategies.STRATEGIES))
+    ap.add_argument("--sites", nargs="+", default=list(strategies.SITES), choices=list(strategies.SITES))
+    ap.add_argument("--difficulty", default="realistic", choices=list(strategies.DIFFICULTIES))
     ap.add_argument("--runs", type=int, default=10, help="simulations per cell")
     ap.add_argument("--years", type=float, default=30)
     ap.add_argument("--seed", type=int, default=1)
@@ -82,6 +83,6 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="sweep.png")
     a = ap.parse_args()
 
-    data = sweep(a.capacity, a.period, a.runs, a.years, a.seed, a.workers)
-    print_table(data, a.capacity, a.period, a.runs)
-    save_heatmaps(data, a.capacity, a.period, a.runs, a.out)
+    data = sweep(a.strategies, a.sites, a.difficulty, a.runs, a.years, a.seed, a.workers)
+    print_table(data, a.strategies, a.sites, a.runs)
+    save_heatmaps(data, a.strategies, a.sites, a.runs, a.out, a.difficulty)
