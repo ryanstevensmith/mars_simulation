@@ -1,26 +1,28 @@
+"""Mars Colony Simulator - main window.
+
+Pick a strategy, a landing site and a difficulty, launch, then watch the base grow, read the
+dashboard and the mission log. Runs are simulated in parallel worker processes.
+"""
+
 import sys
-from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from PyQt5 import QtCore, QtWidgets, uic
+from PyQt5 import QtCore, QtGui, QtWidgets
 
-import matplotlib
-matplotlib.use("Qt5Agg")
-import matplotlib.pyplot as plt
-
-import simulation as sim
 import colonysim_params as ps
-import colony_util as util
+import simulation as sim
+import strategies
 import analysis
-import colony_view
-
-UI_FILE = Path(__file__).resolve().parent / 'colonysim.ui'
+import theme
+from colony_view import ColonyPanel, EVENT_COLORS
+from dashboard import Dashboard
 
 
 class SimWorker(QtCore.QObject):
-    """Runs the simulations off the GUI thread; talks back only through signals."""
+    """Runs the simulations off the GUI thread (in parallel processes when there are several)."""
 
-    progress = QtCore.pyqtSignal(int, int, int)   # run number, days done, total days
-    finished = QtCore.pyqtSignal(list)            # list of SimResult
+    progress = QtCore.pyqtSignal(int, str)        # percent, message
+    finished = QtCore.pyqtSignal(list)            # list of SimResult, in run order
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, params):
@@ -29,150 +31,346 @@ class SimWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
+        p = self.params
+        seeds = [None if p.SEED is None else p.SEED + n for n in range(p.RUNS)]
         try:
-            results = []
-            for n in range(self.params.RUNS):
-                seed = None if self.params.SEED is None else self.params.SEED + n
-                results.append(sim.simulation(
-                    self.params,
-                    progress=lambda done, total, n=n: self.progress.emit(n + 1, done, total),
-                    seed=seed))
+            if p.RUNS == 1:
+                result = sim.simulation(p, seed=seeds[0], progress=lambda done, total: self.progress.emit(
+                    int(100 * done / total), "Simulating day {:,} of {:,}".format(done, total)))
+                self.finished.emit([result])
+                return
+            results = [None] * p.RUNS
+            self.progress.emit(2, "Simulating {} colonies in parallel...".format(p.RUNS))
+            with ProcessPoolExecutor() as pool:
+                futures = {pool.submit(sim.run_one, (p, s)): n for n, s in enumerate(seeds)}
+                for done, future in enumerate(as_completed(futures), 1):
+                    results[futures[future]] = future.result()
+                    self.progress.emit(int(100 * done / p.RUNS), "{} of {} colonies simulated".format(done, p.RUNS))
             self.finished.emit(results)
         except Exception as e:
             self.failed.emit(str(e))
 
 
-class MyWindow(QtWidgets.QMainWindow):
+# ------------------------------------------------------------------ setup panel widgets
+
+
+def label(text, name):
+    w = QtWidgets.QLabel(text)
+    w.setObjectName(name)
+    w.setWordWrap(True)
+    return w
+
+
+class StrategyCard(QtWidgets.QFrame):
+    """One strategy. Compact when not selected; the selected card shows its description."""
+    clicked = QtCore.pyqtSignal(str)
+
+    def __init__(self, strategy):
+        super().__init__()
+        self.key = strategy.key
+        self.setObjectName("card")
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(3)
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(label(strategy.name, "cardTitle"), 1)
+        tag = label(strategy.tagline.upper(), "cardTag")
+        tag.setWordWrap(False)
+        head.addWidget(tag)
+        layout.addLayout(head)
+        self.details = QtWidgets.QWidget()
+        d = QtWidgets.QVBoxLayout(self.details)
+        d.setContentsMargins(0, 2, 0, 0)
+        d.setSpacing(3)
+        d.addWidget(label(strategy.description, "cardText"))
+        d.addWidget(label("+ " + "  ·  ".join(strategy.strengths), "good"))
+        d.addWidget(label("− " + "  ·  ".join(strategy.weaknesses), "bad"))
+        layout.addWidget(self.details)
+        layout.addWidget(label("{} colonists per ship  ·  {} starter modules".format(
+            strategy.colonists_per_ship, sum(strategy.starter_modules.values())), "cardText"))
+
+    def set_selected(self, on):
+        self.details.setVisible(on)
+        self.setProperty("selected", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit(self.key)
+
+
+class Segmented(QtWidgets.QWidget):
+    """A row of exclusive toggle buttons, one per option, with a description underneath."""
+    changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, options, describe):
+        super().__init__()
+        self.describe = describe
+        self.group = QtWidgets.QButtonGroup(self)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.buttons = {}
+        for key, text in options:
+            b = QtWidgets.QPushButton(text)
+            b.setCheckable(True)
+            b.setCursor(QtCore.Qt.PointingHandCursor)
+            self.group.addButton(b)
+            row.addWidget(b)
+            self.buttons[key] = b
+            b.clicked.connect(lambda _, k=key: self.select(k))
+        layout.addLayout(row)
+        self.info = label("", "muted")
+        layout.addWidget(self.info)
+
+    def select(self, key):
+        self.key = key
+        self.buttons[key].setChecked(True)
+        self.info.setText(self.describe(key))
+        self.changed.emit(key)
+
+
+class SetupPanel(QtWidgets.QScrollArea):
+    launch = QtCore.pyqtSignal(object)            # SimParams
 
     def __init__(self):
-        super(MyWindow, self).__init__()
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setMinimumWidth(400)
+        self.setMaximumWidth(460)
+        inner = QtWidgets.QWidget()
+        inner.setObjectName("setup")
+        self.setWidget(inner)
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(8)
 
-        self.ui = uic.loadUi(str(UI_FILE), self)
+        lay.addWidget(label("MARS COLONY", "title"))
+        lay.addWidget(label("Plan a settlement, launch it, and watch it live or die.", "subtitle"))
+
+        lay.addWidget(label("1 · STRATEGY", "section"))
+        self.cards = {}
+        for s in strategies.STRATEGIES.values():
+            card = StrategyCard(s)
+            card.clicked.connect(self.select_strategy)
+            self.cards[s.key] = card
+            lay.addWidget(card)
+
+        lay.addWidget(label("2 · LANDING SITE", "section"))
+        self.site = Segmented([(k, s.name) for k, s in strategies.SITES.items()], self.describe_site)
+        lay.addWidget(self.site)
+
+        lay.addWidget(label("3 · DIFFICULTY", "section"))
+        self.difficulty = Segmented([(k, d.name) for k, d in strategies.DIFFICULTIES.items()],
+                                    lambda k: strategies.DIFFICULTIES[k].description)
+        lay.addWidget(self.difficulty)
+
+        lay.addWidget(label("4 · MISSION", "section"))
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        self.years = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.years.setRange(5, 60)
+        self.years.setValue(30)
+        self.years_label = label("30 years", "muted")
+        self.years.valueChanged.connect(lambda v: self.years_label.setText("{} years".format(v)))
+        self.runs = QtWidgets.QSpinBox()
+        self.runs.setRange(1, 12)
+        self.runs.setValue(5)
+        grid.addWidget(label("Duration", "muted"), 0, 0)
+        grid.addWidget(self.years, 0, 1)
+        grid.addWidget(self.years_label, 0, 2)
+        grid.addWidget(label("Runs to compare", "muted"), 1, 0)
+        grid.addWidget(self.runs, 1, 1, 1, 2)
+        lay.addLayout(grid)
+
+        self.advanced_toggle = QtWidgets.QPushButton("▸  Advanced")
+        self.advanced_toggle.setObjectName("link")
+        self.advanced_toggle.setCursor(QtCore.Qt.PointingHandCursor)
+        self.advanced = QtWidgets.QWidget()
+        adv = QtWidgets.QGridLayout(self.advanced)
+        adv.setContentsMargins(0, 0, 0, 0)
+        self.colonists = QtWidgets.QSpinBox()
+        self.colonists.setRange(0, 500)
+        self.colonists.setSpecialValueText("strategy default")
+        self.interval = QtWidgets.QSpinBox()
+        self.interval.setRange(6, 120)
+        self.interval.setValue(26)
+        self.interval.setSuffix(" months")
+        self.seed = QtWidgets.QLineEdit()
+        self.seed.setPlaceholderText("random")
+        adv.addWidget(label("Colonists per ship", "muted"), 0, 0)
+        adv.addWidget(self.colonists, 0, 1)
+        adv.addWidget(label("Time between ships", "muted"), 1, 0)
+        adv.addWidget(self.interval, 1, 1)
+        adv.addWidget(label("Seed", "muted"), 2, 0)
+        adv.addWidget(self.seed, 2, 1)
+        self.advanced.setVisible(False)
+        self.advanced_toggle.clicked.connect(self.toggle_advanced)
+        lay.addWidget(self.advanced_toggle)
+        lay.addWidget(self.advanced)
+
+        lay.addSpacing(6)
+        self.launch_button = QtWidgets.QPushButton("LAUNCH MISSION")
+        self.launch_button.setObjectName("launch")
+        self.launch_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.launch_button.clicked.connect(self.on_launch)
+        lay.addWidget(self.launch_button)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.setVisible(False)
+        lay.addWidget(self.progress)
+        self.status = label("", "muted")
+        lay.addWidget(self.status)
+        lay.addStretch(1)
+
+        self.select_strategy("balanced")
+        self.site.select("arcadia")
+        self.difficulty.select("realistic")
+
+    def describe_site(self, key):
+        s = strategies.SITES[key]
+        return "{}  Sunlight {:.0%} · ice {:.0%} · storms {:.0%}".format(
+            s.description, s.solar, s.ice, s.storms)
+
+    def select_strategy(self, key):
+        self.strategy = key
+        for k, card in self.cards.items():
+            card.set_selected(k == key)
+
+    def toggle_advanced(self):
+        on = not self.advanced.isVisible()
+        self.advanced.setVisible(on)
+        self.advanced_toggle.setText(("▾" if on else "▸") + "  Advanced")
+
+    def params(self):
+        seed_text = self.seed.text().strip()
+        if seed_text and not seed_text.lstrip("-").isdigit():
+            raise ValueError("Seed must be a whole number (or blank for random)")
+        d = strategies.DIFFICULTIES[self.difficulty.key]
+        p = ps.SimParams(
+            STRATEGY=self.strategy, SITE=self.site.key, SIM_LENGTH=self.years.value() * 365,
+            RUNS=self.runs.value(), SEED=int(seed_text) if seed_text else None,
+            COLONISTS_PER_SHIP=self.colonists.value() or None,
+            ARRIVAL_PERIOD=int(round(self.interval.value() * 30.4)),
+            DISASTER_SCALE=d.disasters, SUPPLY_SCALE=d.supplies)
+        p.validate()
+        return p
+
+    def on_launch(self):
+        try:
+            self.launch.emit(self.params())
+        except ValueError as e:
+            self.status.setText(str(e))
+
+    def busy(self, on):
+        self.launch_button.setEnabled(not on)
+        self.launch_button.setText("SIMULATING..." if on else "LAUNCH MISSION")
+        self.progress.setVisible(on)
+        self.progress.setValue(0)
+
+
+# ------------------------------------------------------------------ mission log
+
+
+class MissionLog(QtWidgets.QWidget):
+    FILTERS = (("Everything", None), ("Disasters", {"storm", "epidemic", "failure", "breach", "cargo", "extinct"}),
+               ("Construction", {"build", "built"}), ("Milestones & tech", {"milestone", "tech", "ship"}))
+
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.run = QtWidgets.QComboBox()
+        self.filter = QtWidgets.QComboBox()
+        for name, _ in self.FILTERS:
+            self.filter.addItem(name)
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderLabels(["Day", "Year", "Event"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setColumnWidth(0, 80)
+        self.tree.setColumnWidth(1, 60)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(label("RUN", "statTitle"))
+        top.addWidget(self.run)
+        top.addSpacing(12)
+        top.addWidget(label("SHOW", "statTitle"))
+        top.addWidget(self.filter)
+        top.addStretch(1)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 10)
+        layout.addLayout(top)
+        layout.addWidget(self.tree, 1)
+        self.run.currentIndexChanged.connect(self.fill)
+        self.filter.currentIndexChanged.connect(self.fill)
+
+    def set_results(self, results):
+        self.results = results
+        self.run.blockSignals(True)
+        self.run.clear()
+        for n in range(len(results)):
+            self.run.addItem("Run {}".format(n + 1))
+        self.run.blockSignals(False)
+        self.fill()
+
+    def fill(self):
+        self.tree.clear()
+        if not self.results:
+            return
+        kinds = self.FILTERS[self.filter.currentIndex()][1]
+        items = []
+        for day, kind, text in self.results[max(0, self.run.currentIndex())].events:
+            if kinds and kind not in kinds:
+                continue
+            item = QtWidgets.QTreeWidgetItem(["{:,}".format(day), "{:.1f}".format(day / 365), text])
+            item.setForeground(2, QtGui.QBrush(EVENT_COLORS.get(kind, theme.TEXT)))
+            for col in (0, 1):
+                item.setForeground(col, QtGui.QBrush(theme.MUTED))
+            items.append(item)
+        self.tree.addTopLevelItems(items)
+
+
+# ------------------------------------------------------------------ main window
+
+
+class MainWindow(QtWidgets.QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mars Colony Simulator")
+        self.resize(1480, 900)
         self.thread = None
         self.worker = None
 
-        # Pre-fill lineEdits with defaults
-        defaults = ps.SimParams()
-        self.ui.lineEdit_simLength.setText(str(defaults.SIM_LENGTH))
-        self.ui.lineEdit_capacity.setText(str(defaults.SHIP_CAPACITY))
-        self.ui.lineEdit_arrival.setText(str(defaults.ARRIVAL_PERIOD))
-        self.ui.lineEdit_crewRatio.setText(str(defaults.CREW_RATIO))
-        self.ui.lineEdit_deathThresh.setText(str(defaults.DEATH_THRESH))
-        self.ui.lineEdit_cooldown.setText(str(defaults.COOLDOWN))
-        self.ui.lineEdit_maxPreg.setText(str(defaults.MAX_PREG))
-        self.ui.lineEdit_newGenPeriod.setText(str(defaults.NEWGEN_PERIOD))
-        self.ui.lineEdit_newGenWindow.setText(str(defaults.NEWGEN_WINDOW))
-        self.ui.lineEdit_pregThresh.setText(str(defaults.PREG_THRESH))
-        self.ui.lineEdit_reproMinAge.setText(str(defaults.PREG_AGE_MIN))
-        self.ui.lineEdit_reproMaxAge.setText(str(defaults.PREG_AGE_MAX))
+        self.setup = SetupPanel()
+        self.colony = ColonyPanel()
+        self.dashboard = Dashboard()
+        self.log = MissionLog()
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self.colony, "Colony")
+        self.tabs.addTab(self.dashboard, "Dashboard")
+        self.tabs.addTab(self.log, "Mission log")
+        for i in (1, 2):
+            self.tabs.setTabEnabled(i, False)
 
-        self.add_extra_fields(defaults)
-        self.add_result_buttons()
+        root = QtWidgets.QWidget()
+        root.setObjectName("root")
+        layout = QtWidgets.QHBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.setup)
+        layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(root)
+        self.setup.launch.connect(self.start)
 
-        # Text change functions
-        self.calcYears()
-        self.showCrewRatios()
-        self.ui.lineEdit_simLength.textChanged.connect(self.calcYears)
-        self.ui.lineEdit_capacity.textChanged.connect(self.showCrewRatios)
-        self.ui.lineEdit_crewRatio.textChanged.connect(self.showCrewRatios)
-
-        # Button functions
-        self.ui.pushButtonStart.clicked.connect(self.pushButtonStartClicked)
-
-    # (attribute, label, SimParams field, type) for the fields added in code below the .ui's own
-    EXTRA_FIELDS = (
-        ("runs", "Runs", "RUNS", int),
-        ("seed", "Seed (blank = random)", "SEED", int),
-        ("mortality", "Mortality Scale", "MORTALITY_SCALE", float),
-        ("foodPerShip", "Food / Ship / Day", "FOOD_PER_SHIP", float),
-        ("shipFood", "Food Stock / Ship", "SHIP_FOOD_STOCK", float),
-        ("habPerShip", "Habitat / Ship (people)", "HAB_PER_SHIP", int),
-        ("storms", "Dust Storms / Year", "DUST_STORMS_PER_YEAR", float),
-        ("breaches", "Breaches / Year", "BREACHES_PER_YEAR", float),
-        ("epidemics", "Epidemics / Year", "EPIDEMICS_PER_YEAR", float),
-    )
-
-    def add_extra_fields(self, defaults):
-        """Add the resource / disaster / run fields to the parameter column (rows 14+ are free)."""
-        grid = self.ui.gridLayout
-        header = QtWidgets.QLabel("Resources, Disasters & Runs")
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        font = header.font()
-        font.setBold(True)
-        header.setFont(font)
-        grid.addWidget(header, 14, 0)
-
-        form = QtWidgets.QFormLayout()
-        self.extra_edits = {}
-        for attr, label, field, _ in self.EXTRA_FIELDS:
-            edit = QtWidgets.QLineEdit("" if getattr(defaults, field) is None else str(getattr(defaults, field)))
-            self.extra_edits[field] = edit
-            form.addRow(label, edit)
-        grid.addLayout(form, 15, 0)
-
-    def add_result_buttons(self):
-        self.results = None
-        self.colony_window = None
-        self.watch_button = QtWidgets.QPushButton("WATCH COLONY")
-        self.charts_button = QtWidgets.QPushButton("SHOW CHARTS")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.watch_button)
-        row.addWidget(self.charts_button)
-        self.ui.gridLayout.addLayout(row, 45, 0)
-        for b in (self.watch_button, self.charts_button):
-            b.setEnabled(False)
-        self.watch_button.clicked.connect(self.show_colony)
-        self.charts_button.clicked.connect(lambda: self.plot(self.results))
-
-    def show_colony(self):
-        """Open the animated colony view (it starts playing straight away)."""
-        if self.colony_window is not None:
-            self.colony_window.close()
-        self.colony_window = colony_view.ColonyWindow(self.results, self.params)
-        self.colony_window.show()
-        self.colony_window.toggle_play()
-
-    def read_params(self):
-        """Build a validated SimParams from the form. Raises ValueError on bad input."""
-        try:
-            params = ps.SimParams(
-                SIM_LENGTH=int(self.ui.lineEdit_simLength.text()),
-                SHIP_CAPACITY=int(self.ui.lineEdit_capacity.text()),
-                ARRIVAL_PERIOD=int(self.ui.lineEdit_arrival.text()),
-                CREW_RATIO=float(self.ui.lineEdit_crewRatio.text()),
-                DEATH_THRESH=int(self.ui.lineEdit_deathThresh.text()),
-                COOLDOWN=int(self.ui.lineEdit_cooldown.text()),
-                MAX_PREG=int(self.ui.lineEdit_maxPreg.text()),
-                NEWGEN_PERIOD=int(self.ui.lineEdit_newGenPeriod.text()),
-                NEWGEN_WINDOW=int(self.ui.lineEdit_newGenWindow.text()),
-                PREG_THRESH=int(self.ui.lineEdit_pregThresh.text()),
-                PREG_AGE_MIN=int(self.ui.lineEdit_reproMinAge.text()),
-                PREG_AGE_MAX=int(self.ui.lineEdit_reproMaxAge.text()),
-                **self.read_extra_fields(),
-            )
-        except ValueError:
-            raise ValueError("Every parameter must be a number (whole days/years, ratio can be decimal)")
-        params.validate()
-        return params
-
-    def read_extra_fields(self):
-        values = {}
-        for _, _, field, kind in self.EXTRA_FIELDS:
-            text = self.extra_edits[field].text().strip()
-            values[field] = None if (field == "SEED" and not text) else kind(text)
-        return values
-
-    def pushButtonStartClicked(self):
-        try:
-            params = self.read_params()
-        except ValueError as e:
-            self.ui.label_progress.setText("Error: " + str(e))
-            return
-
-        self.ui.pushButtonStart.setEnabled(False)
-        self.ui.listFinalPop.clear()
+    def start(self, params):
         self.params = params
-
+        self.setup.busy(True)
+        self.setup.status.setText("")
+        self.colony.set_placeholder("Simulating {} at {}...".format(params.strategy.name, params.site.name))
         self.thread = QtCore.QThread()
         self.worker = SimWorker(params)
         self.worker.moveToThread(self.thread)
@@ -185,95 +383,37 @@ class MyWindow(QtWidgets.QMainWindow):
         self.thread.finished.connect(self.on_thread_done)
         self.thread.start()
 
-    def on_progress(self, run, done, total):
-        self.ui.label_progress.setText("Run " + str(run) + " of " + str(self.params.RUNS)
-                                       + " - progress: " + str(done) + " of " + str(total))
+    def on_progress(self, percent, message):
+        self.setup.progress.setValue(percent)
+        self.setup.status.setText(message)
 
     def on_failed(self, message):
-        self.ui.label_progress.setText("Error: " + message)
+        self.setup.status.setText("Error: " + message)
 
     def on_thread_done(self):
-        self.ui.pushButtonStart.setEnabled(True)
+        self.setup.busy(False)
         self.thread.deleteLater()
         self.worker.deleteLater()
-        self.thread = None
-        self.worker = None
+        self.thread = self.worker = None
 
     def on_finished(self, results):
-        last = results[-1]
-        for x in last.martians:
-            self.ui.listFinalPop.addItem(str(x.getAge(last.end_day)) + " " + str(x.getSex()) + ", "
-                                         + str(x.getName()) + ", " + str(x.getArrivalDate()))
+        self.setup.status.setText(analysis.describe(analysis.summarize(results)))
+        self.colony.set_results(results)
+        self.dashboard.set_results(results)
+        self.log.set_results(results)
+        for i in (1, 2):
+            self.tabs.setTabEnabled(i, True)
+        self.tabs.setCurrentWidget(self.colony)
 
-        self.ui.label_progress.setText("Done: " + analysis.describe(analysis.summarize(results)))
-        for day, kind, detail in last.events:
-            self.ui.listFinalPop.insertItem(0, "day " + str(day) + ": " + kind + " (" + detail + ")")
 
-        self.results = results
-        self.watch_button.setEnabled(True)
-        self.charts_button.setEnabled(True)
-        self.show_colony()
-
-    def plot(self, results):
-        fig, (ax_pop, ax_food, ax_death) = plt.subplots(3, 1, figsize=(9, 10))
-        days = range(len(results[0].sizes))
-
-        for r in results:
-            ax_pop.plot(days, r.sizes, alpha=0.4)
-        ax_pop.plot(days, self.mean_series(results, "sizes"), color="black", linewidth=2, label="mean population")
-        ax_pop.plot(days, self.mean_series(results, "habitat"), color="tab:red", linestyle="--", label="habitat capacity")
-        for day, kind, _ in results[0].events:
-            if kind == "habitat breach":
-                ax_pop.axvline(day, color="tab:red", alpha=0.3)
-        ax_pop.set_xlabel("Day")
-        ax_pop.set_ylabel("Population")
-        ax_pop.set_title("Population (thin lines: each run; red ticks: breaches in run 1)")
-        ax_pop.legend()
-
-        ax_food.plot(days, self.mean_series(results, "food_satisfaction"), color="tab:green")
-        ax_food.set_ylim(0, 1.05)
-        ax_food.set_ylabel("Share of food need met (mean)")
-        ax_stock = ax_food.twinx()
-        ax_stock.plot(days, self.mean_series(results, "food_stock"), color="tab:orange", alpha=0.7)
-        ax_stock.set_ylabel("Food stock (mean)", color="tab:orange")
-        ax_food.set_xlabel("Day")
-        ax_food.set_title("Food")
-
-        causes = sim.CAUSES
-        means = [sum(r.death_causes[c] for r in results) / len(results) for c in causes]
-        ax_death.bar(causes, means, color="tab:gray")
-        ax_death.set_ylabel("Deaths per run (mean)")
-        ax_death.set_title("Causes of death")
-
-        fig.tight_layout()
-        fig.show()   # non-blocking; plt.show() would start a second event loop
-
-    @staticmethod
-    def mean_series(results, name):
-        return [sum(getattr(r, name)[d] for r in results) / len(results) for d in range(len(results[0].sizes))]
-
-    def calcYears(self):
-        text = self.ui.lineEdit_simLength.text()
-
-        try:
-            yrs = int(text) / 365.0
-            self.ui.label_simYears.setText("= " + str(round(yrs, 2)) + " years")
-        except ValueError:
-            self.ui.label_simYears.setText("= N/A")
-
-    def showCrewRatios(self):
-        try:
-            male_crew, female_crew = util.ratioCalculator(
-                int(self.ui.lineEdit_capacity.text()), float(self.ui.lineEdit_crewRatio.text()))
-            self.ui.label_crewRatioDisplay.setText(
-                "= " + str(male_crew) + " M, " + str(female_crew) + " F crew members")
-        except ValueError:
-            self.ui.label_crewRatioDisplay.setText("= N/A, set ratio")
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(theme.STYLESHEET)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
 
 
 if __name__ == '__main__':
-    app = QtWidgets.QApplication(sys.argv)
-    window = MyWindow()
-    window.show()
-
-    sys.exit(app.exec_())
+    main()
