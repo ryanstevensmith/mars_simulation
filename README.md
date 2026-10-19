@@ -1,35 +1,88 @@
-# mars_sim
+# Mars Colony Simulator
 
 A simulation of a Martian settlement. Pick a strategy, a landing site and a difficulty,
 launch, and watch one connected base grow: ships land colonists and prefab modules, people
 work, raise families and die, and the base builds whatever it is shortest of - until it
 thrives or runs out of air.
 
-## Run
+![The live colony view](assets/dashboard1.png)
 
-```
-pip install -r requirements.txt
-python mars_gui.py
-```
+## Getting started
 
-Run it from this folder. The window has three tabs once a mission has run:
+You need Python 3.9 or newer.
 
-- **Colony** - a live map of the base. Play, pause, change speed (1 day/s to 2 years/s),
-  scrub to any day, switch between runs, and hover over any module for its condition,
-  output and crew.
+1. Open a terminal in this folder (on Windows, PowerShell or the VS Code terminal):
+
+   ```
+   cd mars_simulation
+   ```
+
+2. Install the two libraries it uses, PyQt5 and matplotlib (one-off):
+
+   ```
+   python -m pip install -r requirements.txt
+   ```
+
+3. Start it:
+
+   ```
+   python mars_gui.py
+   ```
+
+**If it doesn't start:**
+
+- *`python` is not recognised* (Windows): use `py` instead of `python` in both commands.
+- *`No module named PyQt5`*: step 2 installed into a different Python. Use the same command
+  (`python` or `py`) for steps 2 and 3.
+- *`No such file` for `mars_gui.py`*: you're not in this folder. The path has spaces, so put it
+  in quotes when you `cd`.
+
+## How to play
+
+You don't steer the colony directly: you make the big decisions before launch, then watch
+how they play out.
+
+1. **Pick a strategy** in the left panel. Click a card to see its strengths and weaknesses.
+2. **Pick a landing site** and a **difficulty**. Start on *Realistic*; *Brutal* is where
+   colonies die.
+3. **Set the mission**: how many years to simulate, and how many runs to compare. Runs are
+   separate simulations with the same choices, so you can see how much comes down to luck.
+4. Click **LAUNCH MISSION**. Runs are simulated in parallel and take a few seconds.
+
+Then use the three tabs:
+
+- **Colony** - a live map of the base that starts playing straight away.
+  - The top bar shows population and the food, water and oxygen reserves ("stable" means
+    production covers need; a red day count means it's running out), plus power, beds,
+    materials and technologies.
+  - Blue dots are Earth-born colonists, orange are Mars-born, and a pink ring means pregnant.
+    Yellow dashed squares are construction sites. Damaged modules flash red, and dust storms
+    tint the screen.
+  - Hover over any module to see its condition, output and crew.
+  - The bottom bar has play/pause, speed (1 day/s to 2 years/s), a slider to jump to any day,
+    and a run picker.
 - **Dashboard** - survival, population, Mars-born share, base size, technology and
-  self-sufficiency across all runs, plus charts for one run (population, production vs need,
-  power, base modules over time, deaths by cause, technology timeline).
+  self-sufficiency across all runs, plus charts for one run: population, local production vs
+  need, power, base modules over time, deaths by cause and the technology timeline.
 - **Mission log** - every landing, disaster, construction, breakthrough and milestone,
   filterable.
 
-Compare every strategy at every site over many runs (survival and final population heatmaps):
+![The dashboard](assets/dashboard2.png)
+
+**Things to try**
+
+- Frontier Town at Hellas Basin on Brutal: watch for *COLONY LOST*.
+- Research Outpost vs Agricultural Colony at Jezero Crater: compare population and
+  technology on the dashboard.
+- Under **Advanced**, halve the time between ships, or set a **seed** to replay the exact same
+  colony.
+
+To compare every strategy at every site over many runs without the GUI (prints a table and
+saves survival and population heatmaps to `sweep.png`):
 
 ```
 python sweep.py --difficulty brutal --runs 20
 ```
-
-Tests (no GUI libraries needed): `python -m unittest discover -s tests`
 
 ## The choices
 
@@ -108,6 +161,7 @@ and with extra urgency when a reserve will run out within months.
 | `dashboard.py` | Dashboard tab (cards + matplotlib charts) |
 | `mars_gui.py` / `theme.py` | Main window and its styling |
 | `sweep.py` | Strategy x site comparison over many runs |
+| `tests/` | Unit tests: `python -m unittest discover -s tests` (no GUI libraries needed) |
 
 Positions on the map are cosmetic, but the counts always match the model.
 
